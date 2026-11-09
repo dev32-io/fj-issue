@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# fj-issue: Forgejo issue/PR attachments using fj's saved login.
+# Anything it does not handle itself is passed through to `fj issue`.
+# Requires: bash 3.2+, curl, jq, git (for repo detection).
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  fj-issue attach [opts] <issue> <file>...      Upload files to an issue or PR, print markdown
+      -m, --message <text>   Also post a comment: <text> followed by the embedded files
+  fj-issue attach [opts] -c <comment-id> <file>...  Upload files to an existing comment
+  fj-issue attachments [opts] <issue>            List attachments on the issue and its comments
+  fj-issue download [opts] <issue> [dir]         Download all those attachments into dir (default .)
+  fj-issue <anything else>                       Runs `fj issue <anything else>`
+
+Options:
+  -r, --repo <owner/repo>  Repository (default: from the git remote)
+  -H, --host <host>        Forgejo host (default: the git remote's host if fj is logged in
+                           there, else the only host fj is logged in to)
+  -R, --remote <name>      Git remote used for detection (default: origin)
+
+Auth: the token saved by `fj auth login`, or $FJ_ISSUE_TOKEN.
+Issues and PRs share numbers, so <issue> may be a PR number.
+EOF
+}
+
+die() { printf 'fj-issue: %s\n' "$*" >&2; exit 1; }
+
+keys_file() {
+  if [ -n "${FJ_KEYS_FILE:-}" ]; then printf '%s\n' "$FJ_KEYS_FILE"; return; fi
+  case "$(uname -s)" in
+    Darwin) printf '%s\n' "$HOME/Library/Application Support/forgejo-cli.forgejo-cli/keys.json" ;;
+    *) printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/forgejo-cli/keys.json" ;;
+  esac
+}
+
+# Sets R_HOST and R_PATH from a git remote URL (ssh, scp-style, or http(s)).
+parse_remote() {
+  local url=$1 rest
+  case "$url" in
+    http://* | https://*)
+      rest=${url#*://}; R_HOST=${rest%%/*}; R_PATH=${rest#*/} ;;
+    ssh://*)
+      rest=${url#ssh://}; R_HOST=${rest%%/*}; R_HOST=${R_HOST%%:*}; R_PATH=${rest#*/} ;;
+    *@*:*)
+      rest=${url#*@}; R_HOST=${rest%%:*}; R_PATH=${rest#*:} ;;
+    *) return 1 ;;
+  esac
+  R_HOST=${R_HOST#*@}
+  R_PATH=${R_PATH%/}
+  R_PATH=${R_PATH%.git}
+}
+
+REPO="" HOST="" REMOTE="origin" MESSAGE="" HAS_MESSAGE=0 COMMENT_ID=""
+ARGS=()
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -r | --repo | -H | --host | -R | --remote | -m | --message | -c | --comment)
+        [ $# -ge 2 ] || die "$1 needs a value"
+        case $1 in
+          -r | --repo) REPO=$2 ;;
+          -H | --host) HOST=$2 ;;
+          -R | --remote) REMOTE=$2 ;;
+          -m | --message) MESSAGE=$2; HAS_MESSAGE=1 ;;
+          -c | --comment) COMMENT_ID=$2 ;;
+        esac
+        shift 2 ;;
+      -h | --help) usage; exit 0 ;;
+      --) shift; ARGS+=("$@"); break ;;
+      -?*) die "unknown option: $1 (see fj-issue --help)" ;;
+      *) ARGS+=("$1"); shift ;;
+    esac
+  done
+}
+
+resolve() {
+  local keys url hosts
+  keys=$(keys_file)
+  R_HOST="" R_PATH=""
+  if url=$(git remote get-url "$REMOTE" 2>/dev/null); then parse_remote "$url" || true; fi
+
+  if [ -z "$HOST" ]; then
+    if [ -f "$keys" ]; then
+      if [ -n "$R_HOST" ] && jq -e --arg h "$R_HOST" '.hosts[$h]' "$keys" >/dev/null; then
+        HOST=$R_HOST
+      else
+        hosts=$(jq -r '.hosts | keys[]' "$keys")
+        [ -n "$hosts" ] || die "fj is not logged in anywhere; run: fj auth login"
+        [ "$(printf '%s\n' "$hosts" | wc -l | tr -d ' ')" = 1 ] ||
+          die "fj is logged in to several hosts; pass -H <host>"
+        HOST=$hosts
+      fi
+    else
+      HOST=$R_HOST
+    fi
+  fi
+  [ -n "$HOST" ] || die "no host; pass -H <host>"
+
+  if [ -z "$REPO" ]; then
+    [ "$R_HOST" = "$HOST" ] && [ -n "$R_PATH" ] ||
+      die "can't tell the repo from git remote '$REMOTE'; pass -r owner/repo"
+    REPO=$R_PATH
+  fi
+  case $REPO in */*) ;; *) die "repo must be owner/repo, got: $REPO" ;; esac
+
+  if [ -n "${FJ_ISSUE_TOKEN:-}" ]; then
+    TOKEN=$FJ_ISSUE_TOKEN
+  else
+    [ -f "$keys" ] || die "no fj login found at $keys; run: fj auth login"
+    TOKEN=$(jq -r --arg h "$HOST" '.hosts[$h].token // empty' "$keys")
+    [ -n "$TOKEN" ] || die "fj is not logged in to $HOST; run: fj auth login -H $HOST"
+  fi
+  BASE="https://$HOST/api/v1"
+}
+
+# api METHOD PATH [curl args...]: prints the response body, dies on non-2xx.
+api() {
+  local method=$1 path=$2 out code msg
+  shift 2
+  out=$(curl -sS -X "$method" -w '\n%{http_code}' \
+    -H "Authorization: token $TOKEN" -H "Accept: application/json" \
+    "$@" "$BASE$path") || die "request failed: $method $path"
+  code=${out##*$'\n'}
+  out=${out%$'\n'*}
+  case $code in
+    2??) printf '%s' "$out" ;;
+    *)
+      msg=$(printf '%s' "$out" | jq -r '.message // empty' 2>/dev/null) || msg=""
+      [ -n "$msg" ] || msg=$out
+      die "$method $path: HTTP $code: $msg" ;;
+  esac
+}
+
+issue_number() {
+  local n=${1#\#}
+  case $n in '' | *[!0-9]*) die "not an issue number: $1" ;; esac
+  printf '%s\n' "$n"
+}
+
+markdown_for() { # name url
+  local lower
+  lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case $lower in
+    *.png | *.jpg | *.jpeg | *.gif | *.webp | *.svg | *.avif) printf '![%s](%s)\n' "$1" "$2" ;;
+    *) printf '[%s](%s)\n' "$1" "$2" ;;
+  esac
+}
+
+cmd_attach() {
+  local issue="" path f q resp name url md="" body comment
+  set -- ${ARGS[@]+"${ARGS[@]}"}
+  if [ -n "$COMMENT_ID" ]; then
+    [ "$HAS_MESSAGE" = 0 ] || die "-m can't be combined with -c"
+    case $COMMENT_ID in *[!0-9]*) die "not a comment id: $COMMENT_ID" ;; esac
+    path="/repos/$REPO/issues/comments/$COMMENT_ID/assets"
+  else
+    [ $# -ge 1 ] || die "usage: fj-issue attach <issue> <file>..."
+    issue=$(issue_number "$1"); shift
+    path="/repos/$REPO/issues/$issue/assets"
+  fi
+  [ $# -ge 1 ] || die "no files given"
+  # Check every file first so a typo doesn't leave a half-uploaded batch.
+  for f in "$@"; do [ -f "$f" ] && [ -r "$f" ] || die "not a readable file: $f"; done
+
+  for f in "$@"; do
+    q=${f//\\/\\\\}
+    q=${q//\"/\\\"}
+    resp=$(api POST "$path" -F "attachment=@\"$q\"")
+    name=$(printf '%s' "$resp" | jq -r '.name')
+    url=$(printf '%s' "$resp" | jq -r '.browser_download_url')
+    md+=$(markdown_for "$name" "$url")$'\n'
+  done
+  printf '%s' "$md"
+
+  if [ "$HAS_MESSAGE" = 1 ]; then
+    if [ -n "$MESSAGE" ]; then body="$MESSAGE"$'\n\n'"$md"; else body=$md; fi
+    comment=$(api POST "/repos/$REPO/issues/$issue/comments" \
+      -H "Content-Type: application/json" \
+      --data-binary "$(jq -n --arg b "$body" '{body: $b}')")
+    printf 'Comment: %s\n' "$(printf '%s' "$comment" | jq -r '.html_url')" >&2
+  fi
+}
+
+# Prints one tab-separated line per attachment: where, id, size, name, url.
+list_attachments() {
+  local issue=$1 issue_json comments_json
+  # Runs inside $(...), where bash may not apply set -e, so fail explicitly.
+  issue_json=$(api GET "/repos/$REPO/issues/$issue") || exit 1
+  comments_json=$(api GET "/repos/$REPO/issues/$issue/comments") || exit 1
+  printf '%s' "$issue_json" |
+    jq -r '(.assets // [])[] | ["issue", .id, .size, .name, .browser_download_url] | @tsv'
+  printf '%s' "$comments_json" |
+    jq -r '.[] | .id as $c | (.assets // [])[] |
+      ["comment:\($c)", .id, .size, .name, .browser_download_url] | @tsv'
+}
+
+cmd_attachments() {
+  set -- ${ARGS[@]+"${ARGS[@]}"}
+  [ $# -eq 1 ] || die "usage: fj-issue attachments <issue>"
+  local issue list
+  issue=$(issue_number "$1")
+  list=$(list_attachments "$issue")
+  if [ -z "$list" ]; then echo "No attachments." >&2; return; fi
+  printf 'WHERE\tID\tSIZE\tNAME\tURL\n%s\n' "$list"
+}
+
+cmd_download() {
+  set -- ${ARGS[@]+"${ARGS[@]}"}
+  [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: fj-issue download <issue> [dir]"
+  local issue dir list where id size name url dest
+  issue=$(issue_number "$1")
+  dir=${2:-.}
+  list=$(list_attachments "$issue")
+  if [ -z "$list" ]; then echo "No attachments." >&2; return; fi
+  mkdir -p "$dir"
+  while IFS=$'\t' read -r where id size name url; do
+    name=${name##*/}
+    case $name in '' | . | ..) name="attachment-$id" ;; esac
+    dest="$dir/$name"
+    [ -e "$dest" ] && dest="$dir/$id-$name"
+    curl -sS --fail -L -H "Authorization: token $TOKEN" -o "$dest" "$url" ||
+      die "download failed: $url"
+    printf '%s\n' "$dest"
+  done <<<"$list"
+}
+
+case ${1:-} in
+  "" | -h | --help | help) usage ;;
+  attach | attachments | download)
+    cmd=$1; shift
+    parse_args "$@"
+    resolve
+    "cmd_$cmd" ;;
+  *) exec fj issue "$@" ;;
+esac
